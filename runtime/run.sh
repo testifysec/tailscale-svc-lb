@@ -21,8 +21,9 @@ TSD_EXTRA_ARGS="${TSD_EXTRA_ARGS:-}"
 DEBUG_SKIP_LEADER="${DEBUG_SKIP_LEADER:-false}"
 
 set -e
+set -x
 
-TAILSCALED_ARGS="--state=kube:${TS_KUBE_SECRET} --socket=/tmp/tailscaled.sock ${TSD_EXTRA_ARGS}"
+TAILSCALED_ARGS="--state=kube:${TS_KUBE_SECRET} --socket=/tmp/tailscaled.sock ${TSD_EXTRA_ARGS} --statedir=/tmp/tailscaled"
 
 if [ $(cat /proc/sys/net/ipv4/ip_forward) != 1 ]; then
   echo "IPv4 forwarding (/proc/sys/net/ipv4/ip_forward) needs to be enabled, exiting..."
@@ -88,15 +89,47 @@ while [[ "${SVC_IP_RETRIEVED}" == "false" ]]; do
   fi
 done
 
-echo "Adding iptables rule for DNAT"
-iptables -t nat -I PREROUTING -d "${TS_IP}" -j DNAT --to-destination "${SVC_IP}"
-iptables -t nat -A POSTROUTING -j MASQUERADE
+apk update && apk add bind-tools caddy
+FQDN=$(dig -x "${TS_IP}" +short @100.100.100.100)
 
-PRIMARY_NETWORK_INTERFACE=$(route | grep '^default' | grep -o '[^ ]*$')
-iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${PRIMARY_NETWORK_INTERFACE} -j TCPMSS --set-mss 1240   
+
+
+
+# echo "Adding iptables rule for DNAT"
+# iptables -t nat -I PREROUTING -d "${TS_IP}" -j DNAT --to-destination "${SVC_IP}"
+# iptables -t nat -A POSTROUTING -j MASQUERADE
+
+# PRIMARY_NETWORK_INTERFACE=$(route | grep '^default' | grep -o '[^ ]*$')
+# iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${PRIMARY_NETWORK_INTERFACE} -j TCPMSS --set-mss 1240   
 
 echo "Updating secret with Tailscale IP"
 # patch secret with the tailscale ipv4 address
 kubectl patch secret "${TS_KUBE_SECRET}" --namespace "${PROXY_NAMESPACE}" --type=json --patch="[{\"op\":\"replace\",\"path\":\"/data/ts-ip\",\"value\":\"${TS_IP_B64}\"}]"
+
+if [[ ! -z "${TS_DEST_IP}" ]]; then
+  echo "Adding iptables rule for DNAT"
+  iptables -t nat -I PREROUTING -d "$(tailscale --socket=/tmp/tailscaled.sock ip -4)" -j DNAT --to-destination "${SVC_IP}"
+fi
+
+
+FQDN=${FQDN%?}
+echo "FQDN: ${FQDN}"
+
+tailscale --socket=/tmp/tailscaled.sock cert --key-file=key.pem --cert-file=cert.pem ${FQDN}
+
+##make a caddyfile
+cat <<EOF > Caddyfile
+${FQDN} {
+  tls cert.pem key.pem
+  reverse_proxy ${SVC_IP}:8077
+}
+EOF
+
+echo "Starting Caddy"
+caddy start --config Caddyfile --adapter caddyfile
+
+
+
+
 
 wait ${PID}
